@@ -13,10 +13,13 @@ import (
 
 // Default configuration values for WebSocket connections.
 const (
-	DefaultStreamURL       = "wss://stream.binance.com:9443/ws"
-	DefaultRefreshInterval = 30 * time.Minute
-	DefaultPingInterval    = 3 * time.Minute
-	DefaultPongTimeout     = 10 * time.Second
+	DefaultStreamURL          = "wss://stream.binance.com:9443/ws"
+	DefaultRefreshInterval    = 30 * time.Minute
+	DefaultPingInterval       = 3 * time.Minute
+	DefaultPongTimeout        = 10 * time.Second
+	DefaultReconnectDelay     = 5 * time.Second
+	DefaultMaxReconnectDelay  = 5 * time.Minute
+	DefaultReconnectBackoff   = 2.0 // Exponential backoff multiplier
 )
 
 // UserDataStream manages a WebSocket connection to Binance's User Data Stream.
@@ -33,9 +36,17 @@ type UserDataStream struct {
 	connected  bool
 
 	// Configuration
-	refreshInterval time.Duration
-	pingInterval    time.Duration
-	pongTimeout     time.Duration
+	refreshInterval   time.Duration
+	pingInterval      time.Duration
+	pongTimeout       time.Duration
+	reconnectDelay    time.Duration
+	maxReconnectDelay time.Duration
+	reconnectBackoff  float64
+	autoReconnect     bool
+
+	// Reconnection state
+	ctx           context.Context
+	wasConnected  bool // Tracks if we were previously connected (for OnReconnected vs OnConnected)
 }
 
 // EventHandler processes events from the User Data Stream.
@@ -48,6 +59,9 @@ type EventHandler interface {
 	OnConnected()
 	// OnDisconnected is called when the WebSocket connection is lost.
 	OnDisconnected()
+	// OnReconnected is called when the WebSocket connection is re-established after a disconnection.
+	// This is a good time to poll for any transfers that may have been missed.
+	OnReconnected()
 }
 
 // StreamOption configures the UserDataStream.
@@ -70,14 +84,18 @@ func WithRefreshInterval(d time.Duration) StreamOption {
 // NewUserDataStream creates a new User Data Stream manager.
 func NewUserDataStream(client *Client, handler EventHandler, opts ...StreamOption) *UserDataStream {
 	s := &UserDataStream{
-		client:          client,
-		streamURL:       DefaultStreamURL,
-		handler:         handler,
-		errorChan:       make(chan error, 10),
-		doneChan:        make(chan struct{}),
-		refreshInterval: DefaultRefreshInterval,
-		pingInterval:    DefaultPingInterval,
-		pongTimeout:     DefaultPongTimeout,
+		client:            client,
+		streamURL:         DefaultStreamURL,
+		handler:           handler,
+		errorChan:         make(chan error, 10),
+		doneChan:          make(chan struct{}),
+		refreshInterval:   DefaultRefreshInterval,
+		pingInterval:      DefaultPingInterval,
+		pongTimeout:       DefaultPongTimeout,
+		reconnectDelay:    DefaultReconnectDelay,
+		maxReconnectDelay: DefaultMaxReconnectDelay,
+		reconnectBackoff:  DefaultReconnectBackoff,
+		autoReconnect:     true, // Enable auto-reconnect by default
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -85,9 +103,37 @@ func NewUserDataStream(client *Client, handler EventHandler, opts ...StreamOptio
 	return s
 }
 
+// WithReconnectDelay sets the initial reconnection delay.
+func WithReconnectDelay(d time.Duration) StreamOption {
+	return func(s *UserDataStream) {
+		s.reconnectDelay = d
+	}
+}
+
+// WithMaxReconnectDelay sets the maximum reconnection delay.
+func WithMaxReconnectDelay(d time.Duration) StreamOption {
+	return func(s *UserDataStream) {
+		s.maxReconnectDelay = d
+	}
+}
+
+// WithAutoReconnect enables or disables automatic reconnection.
+func WithAutoReconnect(enabled bool) StreamOption {
+	return func(s *UserDataStream) {
+		s.autoReconnect = enabled
+	}
+}
+
 // Connect establishes the WebSocket connection.
 // It obtains a listen key and connects to the User Data Stream.
 func (s *UserDataStream) Connect(ctx context.Context) error {
+	s.ctx = ctx
+	return s.connect(false)
+}
+
+// connect is the internal connection method.
+// isReconnect indicates whether this is a reconnection attempt.
+func (s *UserDataStream) connect(isReconnect bool) error {
 	// Obtain listen key
 	listenKey, err := s.client.CreateListenKey()
 	if err != nil {
@@ -97,7 +143,7 @@ func (s *UserDataStream) Connect(ctx context.Context) error {
 
 	// Connect to WebSocket
 	wsURL := s.streamURL + "/" + listenKey
-	conn, _, err := websocket.DefaultDialer.DialContext(ctx, wsURL, nil)
+	conn, _, err := websocket.DefaultDialer.DialContext(s.ctx, wsURL, nil)
 	if err != nil {
 		return fmt.Errorf("connecting to WebSocket: %w", err)
 	}
@@ -105,6 +151,8 @@ func (s *UserDataStream) Connect(ctx context.Context) error {
 	s.mu.Lock()
 	s.conn = conn
 	s.connected = true
+	wasConnected := s.wasConnected
+	s.wasConnected = true
 	s.mu.Unlock()
 
 	// Set up pong handler
@@ -112,12 +160,16 @@ func (s *UserDataStream) Connect(ctx context.Context) error {
 		return conn.SetReadDeadline(time.Now().Add(s.pongTimeout + s.pingInterval))
 	})
 
-	// Notify handler
-	s.handler.OnConnected()
+	// Notify handler - use OnReconnected if this was a reconnection
+	if isReconnect || wasConnected {
+		s.handler.OnReconnected()
+	} else {
+		s.handler.OnConnected()
+	}
 
 	// Start background goroutines
 	go s.readLoop()
-	go s.keepAlive(ctx)
+	go s.keepAlive(s.ctx)
 
 	return nil
 }
@@ -185,11 +237,61 @@ func (s *UserDataStream) readLoop() {
 				return
 			default:
 				s.handler.OnError(fmt.Errorf("reading WebSocket message: %w", err))
+				s.handler.OnDisconnected()
+				// Attempt reconnection if enabled
+				if s.autoReconnect {
+					go s.reconnectLoop()
+				}
 				return
 			}
 		}
 
 		s.processMessage(message)
+	}
+}
+
+// reconnectLoop attempts to reconnect with exponential backoff.
+func (s *UserDataStream) reconnectLoop() {
+	delay := s.reconnectDelay
+
+	for {
+		select {
+		case <-s.doneChan:
+			return
+		case <-s.ctx.Done():
+			return
+		default:
+		}
+
+		// Wait before attempting reconnection
+		select {
+		case <-s.doneChan:
+			return
+		case <-s.ctx.Done():
+			return
+		case <-time.After(delay):
+		}
+
+		// Close old listen key if it exists
+		if s.listenKey != "" {
+			_ = s.client.CloseListenKey(s.listenKey)
+			s.listenKey = ""
+		}
+
+		// Attempt to reconnect
+		err := s.connect(true)
+		if err == nil {
+			// Successfully reconnected
+			return
+		}
+
+		s.handler.OnError(fmt.Errorf("reconnection failed: %w", err))
+
+		// Increase delay with exponential backoff
+		delay = time.Duration(float64(delay) * s.reconnectBackoff)
+		if delay > s.maxReconnectDelay {
+			delay = s.maxReconnectDelay
+		}
 	}
 }
 

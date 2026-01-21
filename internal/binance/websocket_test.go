@@ -87,6 +87,7 @@ type mockEventHandler struct {
 	errors         []error
 	connected      bool
 	disconnected   bool
+	reconnected    bool
 }
 
 func (h *mockEventHandler) OnBalanceUpdate(event *BalanceUpdateEvent) {
@@ -103,6 +104,10 @@ func (h *mockEventHandler) OnConnected() {
 
 func (h *mockEventHandler) OnDisconnected() {
 	h.disconnected = true
+}
+
+func (h *mockEventHandler) OnReconnected() {
+	h.reconnected = true
 }
 
 func TestNewUserDataStream(t *testing.T) {
@@ -216,5 +221,51 @@ func TestIsConnectedInitialState(t *testing.T) {
 
 	if stream.IsConnected() {
 		t.Error("IsConnected() = true, want false for new stream")
+	}
+}
+
+func TestDefaultReconnectionSettings(t *testing.T) {
+	if DefaultReconnectDelay != 5*time.Second {
+		t.Errorf("DefaultReconnectDelay = %v, want 5s", DefaultReconnectDelay)
+	}
+	if DefaultMaxReconnectDelay != 5*time.Minute {
+		t.Errorf("DefaultMaxReconnectDelay = %v, want 5m", DefaultMaxReconnectDelay)
+	}
+	if DefaultReconnectBackoff != 2.0 {
+		t.Errorf("DefaultReconnectBackoff = %v, want 2.0", DefaultReconnectBackoff)
+	}
+}
+
+func TestUserDataStreamReconnectOptions(t *testing.T) {
+	client := NewClient("api-key", "secret-key")
+	handler := &mockEventHandler{}
+	customDelay := 10 * time.Second
+	customMaxDelay := 10 * time.Minute
+
+	stream := NewUserDataStream(client, handler,
+		WithReconnectDelay(customDelay),
+		WithMaxReconnectDelay(customMaxDelay),
+		WithAutoReconnect(false),
+	)
+
+	if stream.reconnectDelay != customDelay {
+		t.Errorf("reconnectDelay = %v, want %v", stream.reconnectDelay, customDelay)
+	}
+	if stream.maxReconnectDelay != customMaxDelay {
+		t.Errorf("maxReconnectDelay = %v, want %v", stream.maxReconnectDelay, customMaxDelay)
+	}
+	if stream.autoReconnect {
+		t.Error("autoReconnect = true, want false")
+	}
+}
+
+func TestUserDataStreamAutoReconnectEnabled(t *testing.T) {
+	client := NewClient("api-key", "secret-key")
+	handler := &mockEventHandler{}
+
+	stream := NewUserDataStream(client, handler)
+
+	if !stream.autoReconnect {
+		t.Error("autoReconnect = false, want true (default)")
 	}
 }

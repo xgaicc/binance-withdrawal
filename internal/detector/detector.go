@@ -274,6 +274,15 @@ func (d *Detector) OnDisconnected() {
 	d.logger.Info("WebSocket disconnected from User Data Stream")
 }
 
+// OnReconnected is called when the WebSocket reconnects after a disconnection.
+// This triggers a poll of recent transfers to catch any that were missed.
+func (d *Detector) OnReconnected() {
+	d.logger.Info("WebSocket reconnected to User Data Stream, polling for missed transfers")
+	if err := d.pollRecentTransfers(); err != nil {
+		d.logger.Warn("failed to poll recent transfers after reconnection", "error", err)
+	}
+}
+
 // IsConnected returns whether the detector is connected to the WebSocket.
 func (d *Detector) IsConnected() bool {
 	return d.stream.IsConnected()

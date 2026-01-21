@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -366,5 +367,119 @@ func TestDetectorStop(t *testing.T) {
 	if err != nil {
 		// Some error is expected since we never connected
 		t.Logf("Stop() error (expected): %v", err)
+	}
+}
+
+func TestOnReconnectedPollsTransfers(t *testing.T) {
+	now := time.Now()
+	transfers := []binance.SubAccountTransfer{
+		{
+			TranID:     99999,
+			FromEmail:  "sub@example.com",
+			Asset:      "ETH",
+			Qty:        "2.5",
+			CreateTime: now.Add(-1 * time.Minute).UnixMilli(),
+		},
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(transfers)
+	}))
+	defer server.Close()
+
+	client := binance.NewClient("api-key", "secret-key", binance.WithBaseURL(server.URL))
+	handler := &recordingHandler{}
+	d := New(client, handler.handle)
+
+	// Call OnReconnected to simulate reconnection
+	d.OnReconnected()
+
+	got := handler.getTransfers()
+	if len(got) != 1 {
+		t.Fatalf("len(transfers) = %d, want 1", len(got))
+	}
+	if got[0].TranID != "99999" {
+		t.Errorf("TranID = %q, want 99999", got[0].TranID)
+	}
+	if got[0].Asset != "ETH" {
+		t.Errorf("Asset = %q, want ETH", got[0].Asset)
+	}
+}
+
+func TestOnReconnectedUsesLastProcessedTime(t *testing.T) {
+	// Track the request parameters
+	var requestedStartTime, requestedEndTime int64
+	now := time.Now()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Parse query parameters to verify time range
+		requestedStartTime, _ = strconv.ParseInt(r.URL.Query().Get("startTime"), 10, 64)
+		requestedEndTime, _ = strconv.ParseInt(r.URL.Query().Get("endTime"), 10, 64)
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode([]binance.SubAccountTransfer{})
+	}))
+	defer server.Close()
+
+	client := binance.NewClient("api-key", "secret-key", binance.WithBaseURL(server.URL))
+	handler := &recordingHandler{}
+	d := New(client, handler.handle, WithLookbackDuration(10*time.Minute))
+
+	// Set a lastProcessedTime to simulate previous activity
+	lastProcessed := now.Add(-2 * time.Minute)
+	d.lastProcessedMu.Lock()
+	d.lastProcessedTime = lastProcessed
+	d.lastProcessedMu.Unlock()
+
+	// Call OnReconnected
+	d.OnReconnected()
+
+	// Verify the start time used was the lastProcessedTime, not the lookback
+	startTime := time.UnixMilli(requestedStartTime)
+	// Allow 1 second tolerance for timing
+	if startTime.Before(lastProcessed.Add(-1*time.Second)) || startTime.After(lastProcessed.Add(1*time.Second)) {
+		t.Errorf("startTime = %v, expected close to lastProcessedTime %v", startTime, lastProcessed)
+	}
+
+	// End time should be close to now
+	endTime := time.UnixMilli(requestedEndTime)
+	if endTime.Before(now.Add(-2*time.Second)) || endTime.After(now.Add(2*time.Second)) {
+		t.Errorf("endTime = %v, expected close to now %v", endTime, now)
+	}
+}
+
+func TestOnConnectedDoesNotPoll(t *testing.T) {
+	requestCount := 0
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode([]binance.SubAccountTransfer{})
+	}))
+	defer server.Close()
+
+	client := binance.NewClient("api-key", "secret-key", binance.WithBaseURL(server.URL))
+	handler := &recordingHandler{}
+	d := New(client, handler.handle)
+
+	// OnConnected should NOT trigger polling (only startup and reconnection do)
+	d.OnConnected()
+
+	if requestCount != 0 {
+		t.Errorf("OnConnected() made %d API requests, want 0", requestCount)
+	}
+}
+
+func TestOnDisconnectedLogsOnly(t *testing.T) {
+	client := binance.NewClient("api-key", "secret-key")
+	handler := &recordingHandler{}
+	d := New(client, handler.handle)
+
+	// OnDisconnected should not panic and should not process transfers
+	d.OnDisconnected()
+
+	if len(handler.getTransfers()) != 0 {
+		t.Error("OnDisconnected() should not process transfers")
 	}
 }
