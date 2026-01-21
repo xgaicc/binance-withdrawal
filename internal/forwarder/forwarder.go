@@ -3,6 +3,7 @@
 package forwarder
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -11,6 +12,7 @@ import (
 	"github.com/binance-withdrawal/internal/binance"
 	"github.com/binance-withdrawal/internal/config"
 	"github.com/binance-withdrawal/internal/model"
+	"github.com/binance-withdrawal/internal/retry"
 	"github.com/binance-withdrawal/internal/sm"
 	"github.com/binance-withdrawal/internal/store"
 )
@@ -29,11 +31,12 @@ var (
 //   - Layer 1 (BoltDB): Fast-path local duplicate check
 //   - Layer 2 (Binance): Source-of-truth verification via withdrawal history API
 type Forwarder struct {
-	client  *binance.Client
-	store   *store.Store
-	destCfg *config.DestinationConfig
-	sm      *sm.StateMachine
-	logger  *slog.Logger
+	client     *binance.Client
+	store      *store.Store
+	destCfg    *config.DestinationConfig
+	sm         *sm.StateMachine
+	logger     *slog.Logger
+	retryCfg   *retry.Config
 }
 
 // ForwarderOption configures the Forwarder.
@@ -46,14 +49,22 @@ func WithForwarderLogger(l *slog.Logger) ForwarderOption {
 	}
 }
 
+// WithRetryConfig sets a custom retry configuration.
+func WithRetryConfig(cfg *retry.Config) ForwarderOption {
+	return func(f *Forwarder) {
+		f.retryCfg = cfg
+	}
+}
+
 // New creates a new Forwarder.
 func New(client *binance.Client, st *store.Store, destCfg *config.DestinationConfig, opts ...ForwarderOption) *Forwarder {
 	f := &Forwarder{
-		client:  client,
-		store:   st,
-		destCfg: destCfg,
-		sm:      sm.New(),
-		logger:  slog.Default(),
+		client:   client,
+		store:    st,
+		destCfg:  destCfg,
+		sm:       sm.New(),
+		logger:   slog.Default(),
+		retryCfg: retry.DefaultConfig(),
 	}
 	for _, opt := range opts {
 		opt(f)
@@ -98,11 +109,15 @@ const (
 // Processing flow:
 //  1. Layer 1 (BoltDB): Check if transfer is already in store with terminal status
 //  2. Layer 2 (Binance): Query withdrawal history by withdrawOrderId (which equals tranId)
-//  3. If no withdrawal exists, initiate the withdrawal
+//  3. If no withdrawal exists, initiate the withdrawal with retry on transient errors
 //  4. Update store with result
 //
+// Transient errors (network timeouts, rate limits, service unavailable) are automatically
+// retried with exponential backoff up to MaxAttempts. The retry count is tracked in
+// the TransferRecord.
+//
 // This ensures a transfer is never forwarded twice, even if BoltDB state is lost.
-func (f *Forwarder) Forward(transfer *model.TransferRecord) *ForwardResult {
+func (f *Forwarder) Forward(ctx context.Context, transfer *model.TransferRecord) *ForwardResult {
 	now := time.Now()
 	result := &ForwardResult{TranID: transfer.TranID}
 
@@ -197,6 +212,7 @@ func (f *Forwarder) Forward(transfer *model.TransferRecord) *ForwardResult {
 	}
 
 	// Initiate withdrawal with withdrawOrderId set to tranId for idempotency
+	// Uses retry logic for transient errors (network timeouts, rate limits, 503s)
 	f.logger.Info("initiating withdrawal",
 		"tran_id", transfer.TranID,
 		"asset", transfer.Asset,
@@ -205,19 +221,48 @@ func (f *Forwarder) Forward(transfer *model.TransferRecord) *ForwardResult {
 		"dest_network", dest.Network,
 	)
 
-	withdrawResp, err := f.client.Withdraw(&binance.WithdrawRequest{
+	withdrawReq := &binance.WithdrawRequest{
 		Coin:            transfer.Asset,
 		Network:         dest.Network,
 		Address:         dest.Address,
 		Amount:          transfer.Amount,
 		WithdrawOrderID: transfer.TranID, // Key for idempotency!
+	}
+
+	withdrawResp, retryResult := retry.DoWithResult(ctx, f.retryCfg, func() (*binance.WithdrawResponse, error) {
+		return f.client.Withdraw(withdrawReq)
 	})
-	if err != nil {
-		f.logger.Error("withdrawal failed", "error", err)
-		// Don't mark as failed yet - could be transient
-		// Let the caller decide on retry logic
+
+	// Update retry count in transfer record
+	if retryResult.Attempts > 1 {
+		transfer.RetryCount = retryResult.Attempts - 1 // Attempts includes initial try
+		f.logger.Info("withdrawal completed after retries",
+			"tran_id", transfer.TranID,
+			"attempts", retryResult.Attempts,
+			"retry_count", transfer.RetryCount,
+		)
+		// Persist the retry count
+		if err := f.updateRetryCount(transfer); err != nil {
+			f.logger.Warn("failed to update retry count", "error", err)
+		}
+	}
+
+	if retryResult.Err != nil {
+		f.logger.Error("withdrawal failed after retries",
+			"error", retryResult.Err,
+			"attempts", retryResult.Attempts,
+			"is_transient", retry.IsTransient(retryResult.Err),
+		)
+
+		// Only mark as failed if it's a permanent error or we've exhausted retries
+		if !retry.IsTransient(retryResult.Err) {
+			// Permanent error - mark as failed
+			f.markAsFailed(transfer, fmt.Sprintf("withdrawal failed: %v", retryResult.Err), now)
+		}
+		// If transient and exhausted retries, leave as PENDING for later retry
+
 		result.Status = StatusFailed
-		result.Error = fmt.Errorf("withdrawal API call: %w", err)
+		result.Error = fmt.Errorf("withdrawal API call: %w", retryResult.Err)
 		return result
 	}
 
@@ -382,10 +427,25 @@ func (f *Forwarder) updateStoreFromWithdrawal(transfer *model.TransferRecord, wi
 	return nil
 }
 
+// updateRetryCount updates the retry count for a transfer record in the store.
+func (f *Forwarder) updateRetryCount(transfer *model.TransferRecord) error {
+	rec, err := f.store.Get(transfer.TranID)
+	if err != nil {
+		return fmt.Errorf("getting record: %w", err)
+	}
+
+	rec.RetryCount = transfer.RetryCount
+	if err := f.store.Update(rec); err != nil {
+		return fmt.Errorf("updating record: %w", err)
+	}
+
+	return nil
+}
+
 // RecoverPending processes any PENDING records on startup.
 // This handles the case where the service crashed after recording a transfer
 // but before completing the withdrawal.
-func (f *Forwarder) RecoverPending() error {
+func (f *Forwarder) RecoverPending(ctx context.Context) error {
 	pendingRecords, err := f.store.GetByStatus(string(model.StatusPending))
 	if err != nil {
 		return fmt.Errorf("getting pending records: %w", err)
@@ -394,7 +454,7 @@ func (f *Forwarder) RecoverPending() error {
 	f.logger.Info("recovering pending records", "count", len(pendingRecords))
 
 	for _, rec := range pendingRecords {
-		result := f.Forward(rec)
+		result := f.Forward(ctx, rec)
 		f.logger.Info("recovery result",
 			"tran_id", rec.TranID,
 			"status", result.Status,
