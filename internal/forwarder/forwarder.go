@@ -11,6 +11,7 @@ import (
 
 	"github.com/binance-withdrawal/internal/binance"
 	"github.com/binance-withdrawal/internal/config"
+	"github.com/binance-withdrawal/internal/metrics"
 	"github.com/binance-withdrawal/internal/model"
 	"github.com/binance-withdrawal/internal/retry"
 	"github.com/binance-withdrawal/internal/sm"
@@ -118,8 +119,32 @@ const (
 //
 // This ensures a transfer is never forwarded twice, even if BoltDB state is lost.
 func (f *Forwarder) Forward(ctx context.Context, transfer *model.TransferRecord) *ForwardResult {
-	now := time.Now()
+	startTime := time.Now()
+	now := startTime
 	result := &ForwardResult{TranID: transfer.TranID}
+
+	// Record metrics at the end of the operation
+	defer func() {
+		// Record forward latency
+		latency := time.Since(startTime).Seconds()
+		metrics.RecordForwardLatency(transfer.Asset, latency)
+
+		// Record forward outcome
+		var status string
+		switch result.Status {
+		case StatusForwarded:
+			status = metrics.ForwardStatusForwarded
+		case StatusSkippedDuplicate:
+			status = metrics.ForwardStatusSkippedDuplicate
+		case StatusSkippedAlreadyWithdrawn:
+			status = metrics.ForwardStatusSkippedAlreadyWithdrawn
+		case StatusFailed:
+			status = metrics.ForwardStatusFailed
+		}
+		if status != "" {
+			metrics.RecordForward(transfer.SubAccount, transfer.Asset, status)
+		}
+	}()
 
 	f.logger.Info("processing transfer for forwarding",
 		"tran_id", transfer.TranID,
@@ -154,6 +179,7 @@ func (f *Forwarder) Forward(ctx context.Context, transfer *model.TransferRecord)
 	} else if !errors.Is(err, store.ErrNotFound) {
 		// Unexpected error
 		f.logger.Error("failed to check store", "error", err)
+		metrics.RecordError(metrics.ErrorTypeStoreError)
 		result.Status = StatusFailed
 		result.Error = fmt.Errorf("checking store: %w", err)
 		return result
@@ -164,6 +190,7 @@ func (f *Forwarder) Forward(ctx context.Context, transfer *model.TransferRecord)
 	existingWithdrawal, err := f.client.GetWithdrawalHistoryByOrderID(transfer.TranID)
 	if err != nil {
 		f.logger.Error("failed to check withdrawal history", "error", err)
+		metrics.RecordError(metrics.ErrorTypeAPIError)
 		result.Status = StatusFailed
 		result.Error = fmt.Errorf("checking withdrawal history: %w", err)
 		return result
@@ -196,6 +223,7 @@ func (f *Forwarder) Forward(ctx context.Context, transfer *model.TransferRecord)
 			"asset", transfer.Asset,
 			"error", err,
 		)
+		metrics.RecordError(metrics.ErrorTypeDestinationNotConfigured)
 		// Mark as failed in store
 		f.markAsFailed(transfer, fmt.Sprintf("destination not configured: %v", err), now)
 		result.Status = StatusFailed
@@ -257,6 +285,8 @@ func (f *Forwarder) Forward(ctx context.Context, transfer *model.TransferRecord)
 			"is_transient", isTransient,
 			"is_permanent", isPermanent,
 		)
+
+		metrics.RecordError(metrics.ErrorTypeWithdrawalFailed)
 
 		// Mark as FAILED if it's a permanent error (requires human intervention)
 		// Permanent errors include:

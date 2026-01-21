@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/binance-withdrawal/internal/binance"
+	"github.com/binance-withdrawal/internal/metrics"
 	"github.com/binance-withdrawal/internal/model"
 )
 
@@ -205,6 +206,9 @@ func (d *Detector) processTransfer(t *binance.SubAccountTransfer) {
 		"amount", record.Amount,
 	)
 
+	// Record metrics
+	metrics.RecordTransferDetected(record.SubAccount, record.Asset)
+
 	// Update last processed time
 	d.lastProcessedMu.Lock()
 	if t.CreateTimeAt.After(d.lastProcessedTime) {
@@ -262,22 +266,27 @@ func (d *Detector) OnBalanceUpdate(event *binance.BalanceUpdateEvent) {
 // OnError is called when an error occurs.
 func (d *Detector) OnError(err error) {
 	d.logger.Error("WebSocket error", "error", err)
+	metrics.RecordError(metrics.ErrorTypeWebSocketError)
 }
 
 // OnConnected is called when the WebSocket connection is established.
 func (d *Detector) OnConnected() {
 	d.logger.Info("WebSocket connected to User Data Stream")
+	metrics.SetWebSocketConnected(true)
 }
 
 // OnDisconnected is called when the WebSocket connection is lost.
 func (d *Detector) OnDisconnected() {
 	d.logger.Info("WebSocket disconnected from User Data Stream")
+	metrics.SetWebSocketConnected(false)
 }
 
 // OnReconnected is called when the WebSocket reconnects after a disconnection.
 // This triggers a poll of recent transfers to catch any that were missed.
 func (d *Detector) OnReconnected() {
 	d.logger.Info("WebSocket reconnected to User Data Stream, polling for missed transfers")
+	metrics.SetWebSocketConnected(true)
+	metrics.RecordWebSocketReconnect()
 	if err := d.pollRecentTransfers(); err != nil {
 		d.logger.Warn("failed to poll recent transfers after reconnection", "error", err)
 	}

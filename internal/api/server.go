@@ -8,7 +8,9 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/binance-withdrawal/internal/metrics"
 	"github.com/binance-withdrawal/internal/model"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 // Server provides HTTP endpoints for monitoring and manual intervention.
@@ -118,6 +120,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/status", s.handleStatus)
 	s.mux.HandleFunc("/transfers", s.handleTransfers)
 	s.mux.HandleFunc("/transfers/", s.handleTransferByID)
+	s.mux.Handle("/metrics", s.metricsHandler())
 }
 
 // withMiddleware wraps the handler with common middleware.
@@ -152,4 +155,21 @@ func (s *Server) writeJSON(w http.ResponseWriter, status int, data interface{}) 
 // writeError writes an error response.
 func (s *Server) writeError(w http.ResponseWriter, status int, message string) {
 	s.writeJSON(w, status, map[string]string{"error": message})
+}
+
+// metricsHandler returns an HTTP handler for Prometheus metrics.
+// It updates the pending count gauge before serving metrics.
+func (s *Server) metricsHandler() http.Handler {
+	promHandler := promhttp.Handler()
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Update pending count from store before serving metrics
+		if s.deps.Store != nil {
+			counts, err := s.deps.Store.CountByStatus()
+			if err == nil {
+				pendingCount := counts[string(model.StatusPending)]
+				metrics.SetPendingCount(pendingCount)
+			}
+		}
+		promHandler.ServeHTTP(w, r)
+	})
 }
