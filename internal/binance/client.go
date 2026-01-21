@@ -261,3 +261,159 @@ func (c *Client) GetSubAccountTransferByID(tranID int64) (*SubAccountTransfer, e
 
 	return nil, fmt.Errorf("transfer %d not found", tranID)
 }
+
+// WithdrawalRecord represents a withdrawal from the master account.
+type WithdrawalRecord struct {
+	ID              string    `json:"id"`
+	Amount          string    `json:"amount"`
+	TransactionFee  string    `json:"transactionFee"`
+	Coin            string    `json:"coin"`
+	Status          int       `json:"status"`
+	Address         string    `json:"address"`
+	TxID            string    `json:"txId"`
+	ApplyTime       string    `json:"applyTime"`
+	Network         string    `json:"network"`
+	TransferType    int       `json:"transferType"`
+	WithdrawOrderID string    `json:"withdrawOrderId"`
+	Info            string    `json:"info"`
+	ConfirmNo       int       `json:"confirmNo"`
+	WalletType      int       `json:"walletType"`
+	TxKey           string    `json:"txKey"`
+	ApplyTimeAt     time.Time `json:"-"` // Parsed from ApplyTime
+}
+
+// Withdrawal status codes from Binance API.
+const (
+	WithdrawalStatusEmailSent        = 0
+	WithdrawalStatusCancelled        = 1
+	WithdrawalStatusAwaitingApproval = 2
+	WithdrawalStatusRejected         = 3
+	WithdrawalStatusProcessing       = 4
+	WithdrawalStatusFailure          = 5
+	WithdrawalStatusCompleted        = 6
+)
+
+// GetWithdrawalHistoryByOrderID retrieves withdrawal history filtered by withdrawOrderId.
+// GET /sapi/v1/capital/withdraw/history
+// Returns nil if no withdrawal with the given order ID exists.
+func (c *Client) GetWithdrawalHistoryByOrderID(withdrawOrderID string) (*WithdrawalRecord, error) {
+	params := url.Values{}
+	params.Set("withdrawOrderId", withdrawOrderID)
+
+	body, err := c.doRequest(http.MethodGet, "/sapi/v1/capital/withdraw/history", params, true)
+	if err != nil {
+		return nil, fmt.Errorf("getting withdrawal history: %w", err)
+	}
+
+	var records []WithdrawalRecord
+	if err := json.Unmarshal(body, &records); err != nil {
+		return nil, fmt.Errorf("parsing withdrawal history: %w", err)
+	}
+
+	if len(records) == 0 {
+		return nil, nil // No withdrawal found with this order ID
+	}
+
+	rec := &records[0]
+	// Parse the apply time
+	if rec.ApplyTime != "" {
+		t, err := time.Parse("2006-01-02 15:04:05", rec.ApplyTime)
+		if err == nil {
+			rec.ApplyTimeAt = t
+		}
+	}
+
+	return rec, nil
+}
+
+// GetWithdrawalHistory retrieves withdrawal history with optional filters.
+// GET /sapi/v1/capital/withdraw/history
+func (c *Client) GetWithdrawalHistory(coin string, status int, startTime, endTime time.Time, limit int) ([]WithdrawalRecord, error) {
+	params := url.Values{}
+
+	if coin != "" {
+		params.Set("coin", coin)
+	}
+	if status >= 0 {
+		params.Set("status", strconv.Itoa(status))
+	}
+	if !startTime.IsZero() {
+		params.Set("startTime", strconv.FormatInt(startTime.UnixMilli(), 10))
+	}
+	if !endTime.IsZero() {
+		params.Set("endTime", strconv.FormatInt(endTime.UnixMilli(), 10))
+	}
+	if limit > 0 {
+		params.Set("limit", strconv.Itoa(limit))
+	}
+
+	body, err := c.doRequest(http.MethodGet, "/sapi/v1/capital/withdraw/history", params, true)
+	if err != nil {
+		return nil, fmt.Errorf("getting withdrawal history: %w", err)
+	}
+
+	var records []WithdrawalRecord
+	if err := json.Unmarshal(body, &records); err != nil {
+		return nil, fmt.Errorf("parsing withdrawal history: %w", err)
+	}
+
+	// Parse timestamps
+	for i := range records {
+		if records[i].ApplyTime != "" {
+			t, err := time.Parse("2006-01-02 15:04:05", records[i].ApplyTime)
+			if err == nil {
+				records[i].ApplyTimeAt = t
+			}
+		}
+	}
+
+	return records, nil
+}
+
+// WithdrawRequest contains the parameters for initiating a withdrawal.
+type WithdrawRequest struct {
+	Coin            string // Required: asset to withdraw
+	Network         string // Required: withdrawal network
+	Address         string // Required: destination address
+	Amount          string // Required: withdrawal amount
+	WithdrawOrderID string // Optional: client-side order ID for idempotency
+	AddressTag      string // Optional: secondary address identifier (e.g., memo, tag)
+	WalletType      int    // Optional: 0=spot wallet, 1=funding wallet (default: 0)
+}
+
+// WithdrawResponse contains the result of a withdrawal request.
+type WithdrawResponse struct {
+	ID string `json:"id"` // Binance withdrawal ID
+}
+
+// Withdraw initiates a withdrawal from the master account.
+// POST /sapi/v1/capital/withdraw/apply
+func (c *Client) Withdraw(req *WithdrawRequest) (*WithdrawResponse, error) {
+	params := url.Values{}
+	params.Set("coin", req.Coin)
+	params.Set("network", req.Network)
+	params.Set("address", req.Address)
+	params.Set("amount", req.Amount)
+
+	if req.WithdrawOrderID != "" {
+		params.Set("withdrawOrderId", req.WithdrawOrderID)
+	}
+	if req.AddressTag != "" {
+		params.Set("addressTag", req.AddressTag)
+	}
+	if req.WalletType > 0 {
+		params.Set("walletType", strconv.Itoa(req.WalletType))
+	}
+
+	body, err := c.doRequest(http.MethodPost, "/sapi/v1/capital/withdraw/apply", params, true)
+	if err != nil {
+		return nil, fmt.Errorf("initiating withdrawal: %w", err)
+	}
+
+	var resp WithdrawResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("parsing withdrawal response: %w", err)
+	}
+
+	return &resp, nil
+}
