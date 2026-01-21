@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/binance-withdrawal/internal/audit"
 	"github.com/binance-withdrawal/internal/binance"
 	"github.com/binance-withdrawal/internal/config"
 	"github.com/binance-withdrawal/internal/metrics"
@@ -37,6 +38,7 @@ type Forwarder struct {
 	destCfg    *config.DestinationConfig
 	sm         *sm.StateMachine
 	logger     *slog.Logger
+	audit      *audit.Logger
 	retryCfg   *retry.Config
 }
 
@@ -57,6 +59,13 @@ func WithRetryConfig(cfg *retry.Config) ForwarderOption {
 	}
 }
 
+// WithAuditLogger sets a custom audit logger.
+func WithAuditLogger(l *audit.Logger) ForwarderOption {
+	return func(f *Forwarder) {
+		f.audit = l
+	}
+}
+
 // New creates a new Forwarder.
 func New(client *binance.Client, st *store.Store, destCfg *config.DestinationConfig, opts ...ForwarderOption) *Forwarder {
 	f := &Forwarder{
@@ -65,6 +74,7 @@ func New(client *binance.Client, st *store.Store, destCfg *config.DestinationCon
 		destCfg:  destCfg,
 		sm:       sm.New(),
 		logger:   slog.Default(),
+		audit:    audit.New(),
 		retryCfg: retry.DefaultConfig(),
 	}
 	for _, opt := range opts {
@@ -312,6 +322,17 @@ func (f *Forwarder) Forward(ctx context.Context, transfer *model.TransferRecord)
 		"tran_id", transfer.TranID,
 		"withdraw_id", withdrawResp.ID,
 	)
+
+	// Audit log: WITHDRAWAL_INITIATED
+	f.audit.LogWithdrawalInitiated(audit.WithdrawalInitiatedEvent{
+		TranID:      transfer.TranID,
+		Asset:       transfer.Asset,
+		Amount:      transfer.Amount,
+		Destination: dest.Address,
+		Network:     dest.Network,
+		WithdrawID:  withdrawResp.ID,
+		Timestamp:   now,
+	})
 
 	if err := f.markAsForwarded(transfer, withdrawResp.ID, dest.Address, dest.Network, now); err != nil {
 		f.logger.Error("failed to update store after forwarding", "error", err)
