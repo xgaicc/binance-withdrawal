@@ -817,3 +817,290 @@ func TestTerminalStateTransferSkipped(t *testing.T) {
 		t.Error("should not have called Binance APIs for terminal state")
 	}
 }
+
+// RecoverPending processes any PENDING records on startup using the mock client.
+func (tf *testForwarder) RecoverPending() error {
+	pendingRecords, err := tf.store.GetByStatus(string(model.StatusPending))
+	if err != nil {
+		return err
+	}
+
+	for _, rec := range pendingRecords {
+		tf.Forward(rec)
+	}
+
+	return nil
+}
+
+// TestRecoverPendingWithNoWithdrawal tests that PENDING records without existing
+// withdrawals are forwarded during recovery.
+func TestRecoverPendingWithNoWithdrawal(t *testing.T) {
+	tf, cleanup := newTestForwarder(t)
+	defer cleanup()
+
+	// Create PENDING records in store (simulating crash before withdrawal)
+	pendingRecs := []*model.TransferRecord{
+		{
+			TranID:       "pending-recover-1",
+			SubAccount:   "test@example.com",
+			Asset:        "SOL",
+			Amount:       "100.0",
+			Status:       string(model.StatusPending),
+			TransferTime: time.Now(),
+			DetectedAt:   time.Now(),
+		},
+		{
+			TranID:       "pending-recover-2",
+			SubAccount:   "test@example.com",
+			Asset:        "ETH",
+			Amount:       "50.0",
+			Status:       string(model.StatusPending),
+			TransferTime: time.Now(),
+			DetectedAt:   time.Now(),
+		},
+	}
+
+	for _, rec := range pendingRecs {
+		if err := tf.store.Create(rec); err != nil {
+			t.Fatalf("creating pending record %s: %v", rec.TranID, err)
+		}
+	}
+
+	// Verify pending records exist
+	pending, err := tf.store.GetByStatus(string(model.StatusPending))
+	if err != nil {
+		t.Fatalf("getting pending records: %v", err)
+	}
+	if len(pending) != 2 {
+		t.Fatalf("expected 2 pending records, got %d", len(pending))
+	}
+
+	// Run recovery
+	if err := tf.RecoverPending(); err != nil {
+		t.Fatalf("recovery failed: %v", err)
+	}
+
+	// Verify all records are now FORWARDED
+	for _, tranID := range []string{"pending-recover-1", "pending-recover-2"} {
+		rec, err := tf.store.Get(tranID)
+		if err != nil {
+			t.Fatalf("getting record %s: %v", tranID, err)
+		}
+		if rec.GetStatus() != model.StatusForwarded {
+			t.Errorf("expected %s status FORWARDED, got %s", tranID, rec.Status)
+		}
+		if rec.WithdrawID == "" {
+			t.Errorf("expected %s to have withdraw ID", tranID)
+		}
+	}
+
+	// Both should have been withdrawn
+	if tf.mockClient.getWithdrawCallCount() != 2 {
+		t.Errorf("expected 2 withdraw calls, got %d", tf.mockClient.getWithdrawCallCount())
+	}
+}
+
+// TestRecoverPendingWithExistingWithdrawal tests that PENDING records with existing
+// withdrawals in Binance are updated to FORWARDED without initiating new withdrawals.
+func TestRecoverPendingWithExistingWithdrawal(t *testing.T) {
+	tf, cleanup := newTestForwarder(t)
+	defer cleanup()
+
+	// Create PENDING record in store
+	pendingRec := &model.TransferRecord{
+		TranID:       "pending-recover-existing",
+		SubAccount:   "test@example.com",
+		Asset:        "SOL",
+		Amount:       "200.0",
+		Status:       string(model.StatusPending),
+		TransferTime: time.Now(),
+		DetectedAt:   time.Now(),
+	}
+	if err := tf.store.Create(pendingRec); err != nil {
+		t.Fatalf("creating pending record: %v", err)
+	}
+
+	// But withdrawal already exists in Binance (crash happened after API succeeded)
+	tf.mockClient.withdrawalHistory["pending-recover-existing"] = &binance.WithdrawalRecord{
+		ID:              "existing-withdraw-recover",
+		WithdrawOrderID: "pending-recover-existing",
+		Address:         "sol-address-123",
+		Network:         "SOL",
+		Amount:          "200.0",
+		TxID:            "blockchain-txid-recover",
+	}
+
+	// Run recovery
+	if err := tf.RecoverPending(); err != nil {
+		t.Fatalf("recovery failed: %v", err)
+	}
+
+	// Verify record is now FORWARDED
+	rec, err := tf.store.Get("pending-recover-existing")
+	if err != nil {
+		t.Fatalf("getting record: %v", err)
+	}
+	if rec.GetStatus() != model.StatusForwarded {
+		t.Errorf("expected status FORWARDED, got %s", rec.Status)
+	}
+	if rec.WithdrawID != "existing-withdraw-recover" {
+		t.Errorf("expected withdraw ID 'existing-withdraw-recover', got %s", rec.WithdrawID)
+	}
+	if rec.WithdrawTxID != "blockchain-txid-recover" {
+		t.Errorf("expected txid 'blockchain-txid-recover', got %s", rec.WithdrawTxID)
+	}
+
+	// Should NOT have initiated a new withdrawal
+	if tf.mockClient.getWithdrawCallCount() != 0 {
+		t.Errorf("expected 0 withdraw calls, got %d", tf.mockClient.getWithdrawCallCount())
+	}
+}
+
+// TestRecoverPendingMixedScenarios tests recovery with a mix of scenarios:
+// - PENDING without existing withdrawal (should forward)
+// - PENDING with existing withdrawal (should update to FORWARDED)
+// - FORWARDED (should be ignored)
+// - FAILED (should be ignored)
+func TestRecoverPendingMixedScenarios(t *testing.T) {
+	tf, cleanup := newTestForwarder(t)
+	defer cleanup()
+
+	// 1. PENDING without existing withdrawal
+	pendingNew := &model.TransferRecord{
+		TranID:       "pending-new",
+		SubAccount:   "test@example.com",
+		Asset:        "SOL",
+		Amount:       "100.0",
+		Status:       string(model.StatusPending),
+		TransferTime: time.Now(),
+		DetectedAt:   time.Now(),
+	}
+	if err := tf.store.Create(pendingNew); err != nil {
+		t.Fatalf("creating pending-new: %v", err)
+	}
+
+	// 2. PENDING with existing withdrawal in Binance
+	pendingExisting := &model.TransferRecord{
+		TranID:       "pending-existing",
+		SubAccount:   "test@example.com",
+		Asset:        "ETH",
+		Amount:       "50.0",
+		Status:       string(model.StatusPending),
+		TransferTime: time.Now(),
+		DetectedAt:   time.Now(),
+	}
+	if err := tf.store.Create(pendingExisting); err != nil {
+		t.Fatalf("creating pending-existing: %v", err)
+	}
+	tf.mockClient.withdrawalHistory["pending-existing"] = &binance.WithdrawalRecord{
+		ID:              "existing-id",
+		WithdrawOrderID: "pending-existing",
+		Address:         "0xeth-address-456",
+		Network:         "ETH",
+		Amount:          "50.0",
+	}
+
+	// 3. Already FORWARDED (should not be processed by recovery)
+	forwarded := &model.TransferRecord{
+		TranID:       "already-forwarded",
+		SubAccount:   "test@example.com",
+		Asset:        "SOL",
+		Amount:       "75.0",
+		Status:       string(model.StatusForwarded),
+		WithdrawID:   "old-withdraw",
+		TransferTime: time.Now(),
+		DetectedAt:   time.Now(),
+	}
+	if err := tf.store.Create(forwarded); err != nil {
+		t.Fatalf("creating forwarded: %v", err)
+	}
+
+	// 4. Already FAILED (should not be processed by recovery)
+	failed := &model.TransferRecord{
+		TranID:       "already-failed",
+		SubAccount:   "unknown@example.com",
+		Asset:        "BTC",
+		Amount:       "1.0",
+		Status:       string(model.StatusFailed),
+		Error:        "destination not configured",
+		TransferTime: time.Now(),
+		DetectedAt:   time.Now(),
+	}
+	if err := tf.store.Create(failed); err != nil {
+		t.Fatalf("creating failed: %v", err)
+	}
+
+	// Run recovery - should only process the 2 PENDING records
+	if err := tf.RecoverPending(); err != nil {
+		t.Fatalf("recovery failed: %v", err)
+	}
+
+	// Verify pending-new is now FORWARDED
+	rec1, _ := tf.store.Get("pending-new")
+	if rec1.GetStatus() != model.StatusForwarded {
+		t.Errorf("pending-new should be FORWARDED, got %s", rec1.Status)
+	}
+
+	// Verify pending-existing is now FORWARDED with existing withdrawal ID
+	rec2, _ := tf.store.Get("pending-existing")
+	if rec2.GetStatus() != model.StatusForwarded {
+		t.Errorf("pending-existing should be FORWARDED, got %s", rec2.Status)
+	}
+	if rec2.WithdrawID != "existing-id" {
+		t.Errorf("pending-existing should have withdraw ID 'existing-id', got %s", rec2.WithdrawID)
+	}
+
+	// Verify forwarded is unchanged
+	rec3, _ := tf.store.Get("already-forwarded")
+	if rec3.GetStatus() != model.StatusForwarded {
+		t.Errorf("already-forwarded should still be FORWARDED, got %s", rec3.Status)
+	}
+	if rec3.WithdrawID != "old-withdraw" {
+		t.Errorf("already-forwarded withdraw ID should be unchanged, got %s", rec3.WithdrawID)
+	}
+
+	// Verify failed is unchanged
+	rec4, _ := tf.store.Get("already-failed")
+	if rec4.GetStatus() != model.StatusFailed {
+		t.Errorf("already-failed should still be FAILED, got %s", rec4.Status)
+	}
+
+	// Only 1 new withdrawal should have been initiated (for pending-new)
+	if tf.mockClient.getWithdrawCallCount() != 1 {
+		t.Errorf("expected 1 withdraw call, got %d", tf.mockClient.getWithdrawCallCount())
+	}
+}
+
+// TestRecoverPendingNoPendingRecords tests recovery when there are no PENDING records.
+func TestRecoverPendingNoPendingRecords(t *testing.T) {
+	tf, cleanup := newTestForwarder(t)
+	defer cleanup()
+
+	// Create only non-PENDING records
+	forwarded := &model.TransferRecord{
+		TranID:       "already-forwarded",
+		SubAccount:   "test@example.com",
+		Asset:        "SOL",
+		Amount:       "100.0",
+		Status:       string(model.StatusForwarded),
+		WithdrawID:   "some-withdraw",
+		TransferTime: time.Now(),
+		DetectedAt:   time.Now(),
+	}
+	if err := tf.store.Create(forwarded); err != nil {
+		t.Fatalf("creating forwarded: %v", err)
+	}
+
+	// Run recovery
+	if err := tf.RecoverPending(); err != nil {
+		t.Fatalf("recovery failed: %v", err)
+	}
+
+	// No API calls should have been made
+	if tf.mockClient.getWithdrawCallCount() != 0 {
+		t.Errorf("expected 0 withdraw calls, got %d", tf.mockClient.getWithdrawCallCount())
+	}
+	if tf.mockClient.getHistoryCallCount() != 0 {
+		t.Errorf("expected 0 history calls, got %d", tf.mockClient.getHistoryCallCount())
+	}
+}
