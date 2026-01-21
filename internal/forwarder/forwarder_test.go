@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -198,6 +199,23 @@ func (tf *testForwarder) Forward(transfer *model.TransferRecord) *ForwardResult 
 		WithdrawOrderID: transfer.TranID,
 	})
 	if err != nil {
+		// Check if this is a permanent error that should be marked as FAILED
+		// Use the same logic as the real forwarder
+		var apiErr *binance.APIError
+		isPermanent := false
+		if errors.As(err, &apiErr) {
+			// Check for permanent withdrawal errors
+			switch apiErr.Code {
+			case -4003, -4004, -4005, -4015, -4026, -4029, -4030, -4057, // Withdrawal-specific
+				-1002, -1013, -1016, -1100, -1102, -1103, -1104, -1105, -1106, -1111, -1112, -1121: // General
+				isPermanent = true
+			}
+		}
+		if isPermanent {
+			// Mark as FAILED with descriptive error
+			tf.markAsFailedMock(transfer, classifyWithdrawalError(err), now)
+		}
+		// If not permanent, leave as PENDING for later retry
 		result.Status = StatusFailed
 		result.Error = err
 		return result
@@ -1068,6 +1086,363 @@ func TestRecoverPendingMixedScenarios(t *testing.T) {
 	// Only 1 new withdrawal should have been initiated (for pending-new)
 	if tf.mockClient.getWithdrawCallCount() != 1 {
 		t.Errorf("expected 1 withdraw call, got %d", tf.mockClient.getWithdrawCallCount())
+	}
+}
+
+// TestPermanentErrorInvalidAddress tests that invalid address errors are marked as FAILED.
+func TestPermanentErrorInvalidAddress(t *testing.T) {
+	tf, cleanup := newTestForwarder(t)
+	defer cleanup()
+
+	// Set up mock to return permanent error for invalid address
+	tf.mockClient.withdrawError = &binance.APIError{Code: -4004, Message: "invalid address"}
+
+	transfer := &model.TransferRecord{
+		TranID:       "tran-perm-001",
+		SubAccount:   "test@example.com",
+		Asset:        "SOL",
+		Amount:       "100.0",
+		TransferTime: time.Now(),
+	}
+
+	result := tf.Forward(transfer)
+
+	if result.Status != StatusFailed {
+		t.Errorf("expected status %s, got %s", StatusFailed, result.Status)
+	}
+
+	// Verify record was marked as FAILED in store with descriptive error
+	rec, err := tf.store.Get("tran-perm-001")
+	if err != nil {
+		t.Fatalf("getting record: %v", err)
+	}
+	if rec.GetStatus() != model.StatusFailed {
+		t.Errorf("expected status FAILED, got %s", rec.Status)
+	}
+	if rec.Error == "" {
+		t.Error("expected error message to be set")
+	}
+	if !strings.Contains(rec.Error, "permanent") {
+		t.Errorf("expected error message to contain 'permanent', got %s", rec.Error)
+	}
+}
+
+// TestPermanentErrorAddressNotWhitelisted tests that whitelist errors are marked as FAILED.
+func TestPermanentErrorAddressNotWhitelisted(t *testing.T) {
+	tf, cleanup := newTestForwarder(t)
+	defer cleanup()
+
+	tf.mockClient.withdrawError = &binance.APIError{Code: -4003, Message: "address not whitelisted"}
+
+	transfer := &model.TransferRecord{
+		TranID:       "tran-perm-002",
+		SubAccount:   "test@example.com",
+		Asset:        "SOL",
+		Amount:       "100.0",
+		TransferTime: time.Now(),
+	}
+
+	result := tf.Forward(transfer)
+
+	if result.Status != StatusFailed {
+		t.Errorf("expected status %s, got %s", StatusFailed, result.Status)
+	}
+
+	rec, err := tf.store.Get("tran-perm-002")
+	if err != nil {
+		t.Fatalf("getting record: %v", err)
+	}
+	if rec.GetStatus() != model.StatusFailed {
+		t.Errorf("expected status FAILED, got %s", rec.Status)
+	}
+	if !strings.Contains(rec.Error, "whitelisted") {
+		t.Errorf("expected error to mention whitelist, got %s", rec.Error)
+	}
+}
+
+// TestPermanentErrorBelowMinimum tests that minimum amount errors are marked as FAILED.
+func TestPermanentErrorBelowMinimum(t *testing.T) {
+	tf, cleanup := newTestForwarder(t)
+	defer cleanup()
+
+	tf.mockClient.withdrawError = &binance.APIError{Code: -4029, Message: "below minimum withdrawal amount"}
+
+	transfer := &model.TransferRecord{
+		TranID:       "tran-perm-003",
+		SubAccount:   "test@example.com",
+		Asset:        "SOL",
+		Amount:       "0.0001", // Very small amount
+		TransferTime: time.Now(),
+	}
+
+	result := tf.Forward(transfer)
+
+	if result.Status != StatusFailed {
+		t.Errorf("expected status %s, got %s", StatusFailed, result.Status)
+	}
+
+	rec, err := tf.store.Get("tran-perm-003")
+	if err != nil {
+		t.Fatalf("getting record: %v", err)
+	}
+	if rec.GetStatus() != model.StatusFailed {
+		t.Errorf("expected status FAILED, got %s", rec.Status)
+	}
+	if !strings.Contains(rec.Error, "minimum") {
+		t.Errorf("expected error to mention minimum, got %s", rec.Error)
+	}
+}
+
+// TestPermanentErrorNetworkNotSupported tests that network not supported errors are marked as FAILED.
+func TestPermanentErrorNetworkNotSupported(t *testing.T) {
+	tf, cleanup := newTestForwarder(t)
+	defer cleanup()
+
+	tf.mockClient.withdrawError = &binance.APIError{Code: -4015, Message: "network not supported for withdrawal"}
+
+	transfer := &model.TransferRecord{
+		TranID:       "tran-perm-004",
+		SubAccount:   "test@example.com",
+		Asset:        "SOL",
+		Amount:       "100.0",
+		TransferTime: time.Now(),
+	}
+
+	result := tf.Forward(transfer)
+
+	if result.Status != StatusFailed {
+		t.Errorf("expected status %s, got %s", StatusFailed, result.Status)
+	}
+
+	rec, err := tf.store.Get("tran-perm-004")
+	if err != nil {
+		t.Fatalf("getting record: %v", err)
+	}
+	if rec.GetStatus() != model.StatusFailed {
+		t.Errorf("expected status FAILED, got %s", rec.Status)
+	}
+	if !strings.Contains(rec.Error, "network") {
+		t.Errorf("expected error to mention network, got %s", rec.Error)
+	}
+}
+
+// TestPermanentErrorDuplicateWithdrawal tests that duplicate withdrawal errors are marked as FAILED.
+func TestPermanentErrorDuplicateWithdrawal(t *testing.T) {
+	tf, cleanup := newTestForwarder(t)
+	defer cleanup()
+
+	tf.mockClient.withdrawError = &binance.APIError{Code: -4026, Message: "duplicate withdrawal order id"}
+
+	transfer := &model.TransferRecord{
+		TranID:       "tran-perm-005",
+		SubAccount:   "test@example.com",
+		Asset:        "SOL",
+		Amount:       "100.0",
+		TransferTime: time.Now(),
+	}
+
+	result := tf.Forward(transfer)
+
+	if result.Status != StatusFailed {
+		t.Errorf("expected status %s, got %s", StatusFailed, result.Status)
+	}
+
+	rec, err := tf.store.Get("tran-perm-005")
+	if err != nil {
+		t.Fatalf("getting record: %v", err)
+	}
+	if rec.GetStatus() != model.StatusFailed {
+		t.Errorf("expected status FAILED, got %s", rec.Status)
+	}
+	if !strings.Contains(rec.Error, "duplicate") {
+		t.Errorf("expected error to mention duplicate, got %s", rec.Error)
+	}
+}
+
+// TestPermanentErrorExceedsMaximum tests that maximum amount errors are marked as FAILED.
+func TestPermanentErrorExceedsMaximum(t *testing.T) {
+	tf, cleanup := newTestForwarder(t)
+	defer cleanup()
+
+	tf.mockClient.withdrawError = &binance.APIError{Code: -4030, Message: "exceeds maximum withdrawal amount"}
+
+	transfer := &model.TransferRecord{
+		TranID:       "tran-perm-006",
+		SubAccount:   "test@example.com",
+		Asset:        "SOL",
+		Amount:       "1000000000.0", // Very large amount
+		TransferTime: time.Now(),
+	}
+
+	result := tf.Forward(transfer)
+
+	if result.Status != StatusFailed {
+		t.Errorf("expected status %s, got %s", StatusFailed, result.Status)
+	}
+
+	rec, err := tf.store.Get("tran-perm-006")
+	if err != nil {
+		t.Fatalf("getting record: %v", err)
+	}
+	if rec.GetStatus() != model.StatusFailed {
+		t.Errorf("expected status FAILED, got %s", rec.Status)
+	}
+	if !strings.Contains(rec.Error, "maximum") {
+		t.Errorf("expected error to mention maximum, got %s", rec.Error)
+	}
+}
+
+// TestTransientErrorRemainsAsPending tests that transient errors leave the record as PENDING.
+func TestTransientErrorRemainsAsPending(t *testing.T) {
+	tf, cleanup := newTestForwarder(t)
+	defer cleanup()
+
+	// Insufficient balance is considered temporary - funds might arrive
+	tf.mockClient.withdrawError = &binance.APIError{Code: -4006, Message: "insufficient balance"}
+
+	transfer := &model.TransferRecord{
+		TranID:       "tran-transient-001",
+		SubAccount:   "test@example.com",
+		Asset:        "SOL",
+		Amount:       "100.0",
+		TransferTime: time.Now(),
+	}
+
+	result := tf.Forward(transfer)
+
+	if result.Status != StatusFailed {
+		t.Errorf("expected status %s, got %s", StatusFailed, result.Status)
+	}
+
+	// Record should be PENDING (not FAILED) for transient errors
+	// so it can be retried later
+	rec, err := tf.store.Get("tran-transient-001")
+	if err != nil {
+		t.Fatalf("getting record: %v", err)
+	}
+	if rec.GetStatus() != model.StatusPending {
+		t.Errorf("expected status PENDING for transient error, got %s", rec.Status)
+	}
+}
+
+// TestAssetNotConfiguredIsFailed tests that unconfigured asset errors are marked as FAILED.
+func TestAssetNotConfiguredIsFailed(t *testing.T) {
+	tf, cleanup := newTestForwarder(t)
+	defer cleanup()
+
+	// BTC is not configured for test@example.com
+	transfer := &model.TransferRecord{
+		TranID:       "tran-noconfig-001",
+		SubAccount:   "test@example.com",
+		Asset:        "BTC", // Not configured in test setup
+		Amount:       "1.0",
+		TransferTime: time.Now(),
+	}
+
+	result := tf.Forward(transfer)
+
+	if result.Status != StatusFailed {
+		t.Errorf("expected status %s, got %s", StatusFailed, result.Status)
+	}
+	if !errors.Is(result.Error, ErrDestinationNotConfigured) {
+		t.Errorf("expected ErrDestinationNotConfigured, got %v", result.Error)
+	}
+
+	rec, err := tf.store.Get("tran-noconfig-001")
+	if err != nil {
+		t.Fatalf("getting record: %v", err)
+	}
+	if rec.GetStatus() != model.StatusFailed {
+		t.Errorf("expected status FAILED, got %s", rec.Status)
+	}
+	if !strings.Contains(rec.Error, "destination not configured") {
+		t.Errorf("expected error to mention 'destination not configured', got %s", rec.Error)
+	}
+}
+
+// TestSubAccountNotConfiguredIsFailed tests that unconfigured sub-account errors are marked as FAILED.
+func TestSubAccountNotConfiguredIsFailed(t *testing.T) {
+	tf, cleanup := newTestForwarder(t)
+	defer cleanup()
+
+	// unknown@example.com is not configured
+	transfer := &model.TransferRecord{
+		TranID:       "tran-noconfig-002",
+		SubAccount:   "unknown@example.com", // Not configured in test setup
+		Asset:        "SOL",
+		Amount:       "100.0",
+		TransferTime: time.Now(),
+	}
+
+	result := tf.Forward(transfer)
+
+	if result.Status != StatusFailed {
+		t.Errorf("expected status %s, got %s", StatusFailed, result.Status)
+	}
+	if !errors.Is(result.Error, ErrDestinationNotConfigured) {
+		t.Errorf("expected ErrDestinationNotConfigured, got %v", result.Error)
+	}
+
+	rec, err := tf.store.Get("tran-noconfig-002")
+	if err != nil {
+		t.Fatalf("getting record: %v", err)
+	}
+	if rec.GetStatus() != model.StatusFailed {
+		t.Errorf("expected status FAILED, got %s", rec.Status)
+	}
+}
+
+// TestClassifyWithdrawalError tests the error classification function.
+func TestClassifyWithdrawalError(t *testing.T) {
+	tests := []struct {
+		name     string
+		err      error
+		contains string
+	}{
+		{
+			name:     "nil error",
+			err:      nil,
+			contains: "unknown",
+		},
+		{
+			name:     "invalid address",
+			err:      &binance.APIError{Code: -4004, Message: "invalid address"},
+			contains: "address is invalid",
+		},
+		{
+			name:     "not whitelisted",
+			err:      &binance.APIError{Code: -4003, Message: "not whitelisted"},
+			contains: "whitelisted",
+		},
+		{
+			name:     "below minimum",
+			err:      &binance.APIError{Code: -4029, Message: "below min"},
+			contains: "minimum withdrawal",
+		},
+		{
+			name:     "network not supported",
+			err:      &binance.APIError{Code: -4015, Message: "network not supported"},
+			contains: "network not supported",
+		},
+		{
+			name:     "duplicate",
+			err:      &binance.APIError{Code: -4026, Message: "duplicate"},
+			contains: "duplicate",
+		},
+		{
+			name:     "generic error",
+			err:      errors.New("some random error"),
+			contains: "withdrawal failed",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := classifyWithdrawalError(tt.err)
+			if !strings.Contains(result, tt.contains) {
+				t.Errorf("classifyWithdrawalError() = %q, want it to contain %q", result, tt.contains)
+			}
+		})
 	}
 }
 

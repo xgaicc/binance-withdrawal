@@ -248,16 +248,27 @@ func (f *Forwarder) Forward(ctx context.Context, transfer *model.TransferRecord)
 	}
 
 	if retryResult.Err != nil {
+		isPermanent := retry.IsPermanent(retryResult.Err)
+		isTransient := retry.IsTransient(retryResult.Err)
+
 		f.logger.Error("withdrawal failed after retries",
 			"error", retryResult.Err,
 			"attempts", retryResult.Attempts,
-			"is_transient", retry.IsTransient(retryResult.Err),
+			"is_transient", isTransient,
+			"is_permanent", isPermanent,
 		)
 
-		// Only mark as failed if it's a permanent error or we've exhausted retries
-		if !retry.IsTransient(retryResult.Err) {
-			// Permanent error - mark as failed
-			f.markAsFailed(transfer, fmt.Sprintf("withdrawal failed: %v", retryResult.Err), now)
+		// Mark as FAILED if it's a permanent error (requires human intervention)
+		// Permanent errors include:
+		// - Invalid destination address
+		// - Asset not supported for withdrawal
+		// - Amount below minimum withdrawal
+		// - Address not whitelisted
+		// - Network not supported
+		if isPermanent || !isTransient {
+			// Permanent error - mark as failed with descriptive message
+			errMsg := classifyWithdrawalError(retryResult.Err)
+			f.markAsFailed(transfer, errMsg, now)
 		}
 		// If transient and exhausted retries, leave as PENDING for later retry
 
@@ -425,6 +436,52 @@ func (f *Forwarder) updateStoreFromWithdrawal(transfer *model.TransferRecord, wi
 	}
 
 	return nil
+}
+
+// classifyWithdrawalError returns a human-readable error message for withdrawal failures.
+// This helps operators understand why a transfer failed and what action is needed.
+func classifyWithdrawalError(err error) string {
+	if err == nil {
+		return "unknown error"
+	}
+
+	// Check for Binance API errors with specific codes
+	var apiErr *binance.APIError
+	if errors.As(err, &apiErr) {
+		switch apiErr.Code {
+		case -4003:
+			return "permanent: destination address not whitelisted in Binance - add address to whitelist"
+		case -4004:
+			return "permanent: destination address is invalid - verify address format"
+		case -4005:
+			return "permanent: withdrawal amount must be positive"
+		case -4015:
+			return "permanent: network not supported for withdrawal - check network configuration"
+		case -4026:
+			return "permanent: duplicate withdrawal - transfer already processed"
+		case -4029:
+			return "permanent: amount below minimum withdrawal - increase amount"
+		case -4030:
+			return "permanent: amount exceeds maximum withdrawal - decrease amount"
+		case -4057:
+			return "permanent: address verification failed - verify address is correct"
+		case -1002:
+			return "permanent: unauthorized - check API key permissions"
+		case -1013:
+			return "permanent: amount below minimum notional"
+		case -1100:
+			return "permanent: illegal characters in parameter"
+		case -1102:
+			return "permanent: mandatory parameter missing"
+		case -1111:
+			return "permanent: precision over maximum allowed"
+		case -1121:
+			return "permanent: invalid asset symbol"
+		}
+	}
+
+	// Generic fallback
+	return fmt.Sprintf("withdrawal failed: %v", err)
 }
 
 // updateRetryCount updates the retry count for a transfer record in the store.

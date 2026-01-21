@@ -101,6 +101,81 @@ func isTransientAPIError(err *binance.APIError) bool {
 	return false
 }
 
+// IsPermanent determines if an error is permanent and should NOT be retried.
+// Permanent errors require human intervention to resolve.
+// These include configuration errors, validation failures, and unsupported operations.
+func IsPermanent(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	// Check for Binance API errors with specific codes
+	var apiErr *binance.APIError
+	if errors.As(err, &apiErr) {
+		return isPermanentAPIError(apiErr)
+	}
+
+	return false
+}
+
+// isPermanentAPIError checks if a Binance API error is permanent.
+// Reference: https://binance-docs.github.io/apidocs/spot/en/#error-codes
+// Reference: https://developers.binance.com/docs/wallet/capital/withdraw
+func isPermanentAPIError(err *binance.APIError) bool {
+	switch err.Code {
+	// General permanent errors
+	case -1002: // UNAUTHORIZED - Unauthorized request
+		return true
+	case -1013: // MIN_NOTIONAL - Amount is below minimum
+		return true
+	case -1016: // SERVICE_SHUTTING_DOWN - This service is no longer available
+		return true
+	case -1021: // INVALID_TIMESTAMP - Timestamp outside recvWindow
+		return false // Could be transient clock drift
+	case -1100: // ILLEGAL_CHARS - Illegal characters found in parameter
+		return true
+	case -1102: // MANDATORY_PARAM_MISSING - Mandatory parameter missing
+		return true
+	case -1103: // UNKNOWN_PARAM - Unknown parameter sent
+		return true
+	case -1104: // UNREAD_PARAM - Not all sent parameters were read
+		return true
+	case -1105: // PARAM_EMPTY - Parameter empty
+		return true
+	case -1106: // PARAM_NOT_REQUIRED - Parameter not required
+		return true
+	case -1111: // BAD_PRECISION - Precision is over the maximum
+		return true
+	case -1112: // NO_DEPTH - No orders on book for symbol
+		return true
+	case -1121: // BAD_SYMBOL - Invalid symbol
+		return true
+
+	// Withdrawal-specific permanent errors
+	case -4003: // WITHDRAW_ADDRESS_NOT_WHITELISTED - Address not whitelisted
+		return true
+	case -4004: // WITHDRAW_ADDRESS_INVALID - Address is invalid
+		return true
+	case -4005: // WITHDRAW_AMOUNT_NEGATIVE - Withdrawal amount must be positive
+		return true
+	case -4006: // WITHDRAW_INSUFFICIENT_BALANCE - Insufficient balance
+		return false // Could be temporary - funds might arrive
+	case -4015: // WITHDRAW_NETWORK_NOT_SUPPORT - Network not supported for withdrawal
+		return true
+	case -4019: // WITHDRAW_COIN_SUSPENDED - Coin withdrawal suspended
+		return false // Could be temporary maintenance
+	case -4026: // WITHDRAW_DUPLICATE - Duplicate withdrawal (same withdrawOrderId)
+		return true // This is idempotency - the withdrawal already exists
+	case -4029: // WITHDRAW_MIN_AMOUNT - Below minimum withdrawal amount
+		return true
+	case -4030: // WITHDRAW_MAX_AMOUNT - Exceeds maximum withdrawal amount
+		return true
+	case -4057: // WITHDRAW_ADDRESS_VERIFY_FAILED - Address verification failed
+		return true
+	}
+	return false
+}
+
 // isNetworkError checks if the error is a network-related error.
 func isNetworkError(err error) bool {
 	if err == nil {

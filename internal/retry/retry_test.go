@@ -452,6 +452,183 @@ func TestDoWithResult_RetryThenSuccess(t *testing.T) {
 	}
 }
 
+func TestIsPermanent_BinanceAPIErrors(t *testing.T) {
+	tests := []struct {
+		name     string
+		err      error
+		expected bool
+	}{
+		{
+			name:     "nil error",
+			err:      nil,
+			expected: false,
+		},
+		{
+			name:     "unauthorized -1002",
+			err:      &binance.APIError{Code: -1002, Message: "unauthorized"},
+			expected: true,
+		},
+		{
+			name:     "min notional -1013",
+			err:      &binance.APIError{Code: -1013, Message: "amount below minimum"},
+			expected: true,
+		},
+		{
+			name:     "service shutting down -1016",
+			err:      &binance.APIError{Code: -1016, Message: "service shutting down"},
+			expected: true,
+		},
+		{
+			name:     "invalid timestamp -1021 (not permanent)",
+			err:      &binance.APIError{Code: -1021, Message: "timestamp out of window"},
+			expected: false,
+		},
+		{
+			name:     "illegal chars -1100",
+			err:      &binance.APIError{Code: -1100, Message: "illegal characters"},
+			expected: true,
+		},
+		{
+			name:     "mandatory param missing -1102",
+			err:      &binance.APIError{Code: -1102, Message: "mandatory parameter missing"},
+			expected: true,
+		},
+		{
+			name:     "bad precision -1111",
+			err:      &binance.APIError{Code: -1111, Message: "precision over maximum"},
+			expected: true,
+		},
+		{
+			name:     "bad symbol -1121",
+			err:      &binance.APIError{Code: -1121, Message: "invalid symbol"},
+			expected: true,
+		},
+		// Transient errors should NOT be permanent
+		{
+			name:     "unknown error -1000 (transient)",
+			err:      &binance.APIError{Code: -1000, Message: "unknown error"},
+			expected: false,
+		},
+		{
+			name:     "disconnected -1001 (transient)",
+			err:      &binance.APIError{Code: -1001, Message: "internal error"},
+			expected: false,
+		},
+		{
+			name:     "too many requests -1003 (transient)",
+			err:      &binance.APIError{Code: -1003, Message: "too many requests"},
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsPermanent(tt.err); got != tt.expected {
+				t.Errorf("IsPermanent() = %v, want %v", got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestIsPermanent_WithdrawalErrors(t *testing.T) {
+	tests := []struct {
+		name     string
+		err      error
+		expected bool
+	}{
+		{
+			name:     "address not whitelisted -4003",
+			err:      &binance.APIError{Code: -4003, Message: "address not whitelisted"},
+			expected: true,
+		},
+		{
+			name:     "invalid address -4004",
+			err:      &binance.APIError{Code: -4004, Message: "invalid address"},
+			expected: true,
+		},
+		{
+			name:     "negative amount -4005",
+			err:      &binance.APIError{Code: -4005, Message: "withdrawal amount must be positive"},
+			expected: true,
+		},
+		{
+			name:     "insufficient balance -4006 (not permanent)",
+			err:      &binance.APIError{Code: -4006, Message: "insufficient balance"},
+			expected: false, // Could be temporary - funds might arrive
+		},
+		{
+			name:     "network not supported -4015",
+			err:      &binance.APIError{Code: -4015, Message: "network not supported for withdrawal"},
+			expected: true,
+		},
+		{
+			name:     "coin suspended -4019 (not permanent)",
+			err:      &binance.APIError{Code: -4019, Message: "coin withdrawal suspended"},
+			expected: false, // Could be temporary maintenance
+		},
+		{
+			name:     "duplicate withdrawal -4026",
+			err:      &binance.APIError{Code: -4026, Message: "duplicate withdrawal order id"},
+			expected: true,
+		},
+		{
+			name:     "below min amount -4029",
+			err:      &binance.APIError{Code: -4029, Message: "below minimum withdrawal amount"},
+			expected: true,
+		},
+		{
+			name:     "exceeds max amount -4030",
+			err:      &binance.APIError{Code: -4030, Message: "exceeds maximum withdrawal amount"},
+			expected: true,
+		},
+		{
+			name:     "address verification failed -4057",
+			err:      &binance.APIError{Code: -4057, Message: "address verification failed"},
+			expected: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsPermanent(tt.err); got != tt.expected {
+				t.Errorf("IsPermanent() = %v, want %v", got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestIsPermanent_NonAPIErrors(t *testing.T) {
+	tests := []struct {
+		name     string
+		err      error
+		expected bool
+	}{
+		{
+			name:     "generic error",
+			err:      errors.New("some random error"),
+			expected: false,
+		},
+		{
+			name:     "network timeout",
+			err:      errors.New("dial tcp: i/o timeout"),
+			expected: false,
+		},
+		{
+			name:     "http 400 error",
+			err:      errors.New("API error: status 400, body: bad request"),
+			expected: false, // We don't classify HTTP errors as permanent without API code
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsPermanent(tt.err); got != tt.expected {
+				t.Errorf("IsPermanent() = %v, want %v", got, tt.expected)
+			}
+		})
+	}
+}
+
 func TestDefaultConfig(t *testing.T) {
 	cfg := DefaultConfig()
 
