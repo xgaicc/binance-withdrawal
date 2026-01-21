@@ -1,0 +1,58 @@
+# Binance Master Withdrawal Service Configuration
+#
+# Copy this file to config.yaml and customize for your environment.
+# Environment variables can be used with ${VAR_NAME} syntax.
+
+# Binance API credentials (master account)
+binance:
+  api_key: ${BINANCE_MASTER_API_KEY}
+  api_secret: ${BINANCE_MASTER_API_SECRET}
+  # Use testnet for development/testing
+  # base_url: "https://testnet.binance.vision"
+  base_url: "https://api.binance.com"
+
+# WebSocket configuration for real-time transfer detection
+websocket:
+  stream_url: "wss://stream.binance.com:9443/ws"
+  listen_key_refresh: 30m    # Binance requires refresh every 60min, we do 30min for safety
+  reconnect_delay: 5s        # Delay before reconnecting on disconnect
+  startup_lookback: 5m       # How far back to check on startup/reconnect
+
+# Destination mappings
+# Each sub-account must be explicitly configured with destination addresses.
+# Transfers from unconfigured sub-accounts will be marked as FAILED.
+destinations:
+  # Example: Production sub-account
+  midas-prod@example.com:
+    SOL:
+      address: "7xKpR3gD..."
+      network: "SOL"
+    ETH:
+      address: "0xAbCdEf..."
+      network: "ETH"
+    USDC:
+      address: "0x123456..."
+      network: "ARBITRUM"
+
+  # Example: Staging sub-account
+  midas-staging@example.com:
+    SOL:
+      address: "8yLqS4hE..."
+      network: "SOL"
+
+# Database configuration (BoltDB)
+database:
+  path: "./data/withdrawals.bolt"
+
+# HTTP server for monitoring and metrics
+server:
+  address: ":8080"
+
+# Completion poller configuration
+poller:
+  interval: 30s   # How often to check for completed withdrawals
+
+# Logging configuration
+logging:
+  level: "info"   # debug, info, warn, error
+  format: "json"  # json or text
